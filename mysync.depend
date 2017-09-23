@@ -1,0 +1,17 @@
+# depslib dependency file v1.0
+1506200405 source:/mnt/personal/my/src/C++/commandline/mysync/main.cpp
+	<sys/stat.h>
+	<sys/types.h>
+	<fcntl.h>
+	<sys/sendfile.h>
+	<unistd.h>
+	<sys/types.h>
+	<sys/time.h>
+	<boost/filesystem.hpp>
+	<cstring>
+	<string>
+	<dirent.h>
+	<time.h>
+	<utime.h>
+	<stdio.h>
+
