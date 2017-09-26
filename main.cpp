@@ -12,17 +12,19 @@
 #include <time.h>
 #include <utime.h>
 #include <stdio.h>
-
+#include <errno.h>
 bool isVerbose=true;
 bool isDryRun=true;
+bool forceSymlinks=false;
 const bool LOG_ONLY_CHANGES=true;
 const bool LOG_PATHS_ONLY=true;
+
 void logImpl(FILE * const dest,const char * const msg,const char * const path,const unsigned int pathLen) {
 //    const unsigned int msgLen=strlen(msg);
     if(LOG_PATHS_ONLY) {
         fprintf(dest,"%s\n",path);
     } else {
-        fprintf(dest,"%s%s\n",msg,path);
+        fprintf(dest,"%s %s\n",msg,path);
     }
 }
 class File;
@@ -125,30 +127,56 @@ namespace copying {
         if(isDryRun)return true;
         return sendfileWrapperTemplate<sizeof(size_t)>( out_fd,  in_fd, offset, count);
     }
+    namespace file {
+        inline const bool copyFileTimeData(const int toFd,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            const struct timespec time[2]= {fromInfo.st_atim,fromInfo.st_mtim};
+            return futimens(toFd,time)==0;
+        }
+        inline const bool copyFilePermissions(const int toFd,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            return fchmod(toFd,fromInfo.st_mode)==0;
+        }
+        inline const bool copyFileOwnership(const int toFd,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            return fchown(toFd,fromInfo.st_uid,fromInfo.st_gid)==0;
+        }
+    }
+    namespace dir {
+        inline const bool copyDirTimeData(const char * const toDirPath,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            timeval atim;
+            timeval mtim;
+            TIMESPEC_TO_TIMEVAL(&atim,&fromInfo.st_atim);
+            TIMESPEC_TO_TIMEVAL(&mtim,&fromInfo.st_mtim);
+            const struct timeval time[2]= {atim,mtim};
+            return utimes(toDirPath,time)==0;
+        }
+        inline const bool copyDirOwnership(const char * const toDirPath,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            return chown(toDirPath,fromInfo.st_uid,fromInfo.st_gid)==0;
+        }
+        inline const bool copyDirPermissions(const char * const toDirPath,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            return chmod(toDirPath,fromInfo.st_mode)==0;
+        }
+    }
+    namespace symlnk {
+        inline const bool copySymlinkTimeData(const char * const toPath,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            timeval atim;
+            timeval mtim;
+            TIMESPEC_TO_TIMEVAL(&atim,&fromInfo.st_atim);
+            TIMESPEC_TO_TIMEVAL(&mtim,&fromInfo.st_mtim);
+            const struct timeval time[2]= {atim,mtim};
+            return lutimes(toPath,time)==0;
+        }
 
-    inline const bool copyFileTimeData(const int toFd,const ::stat_reading::statWrap::statW & fromInfo) {
-        if(isDryRun)return true;
-        const struct timespec time[2]= {fromInfo.st_atim,fromInfo.st_mtim};
-        return futimens(toFd,time)==0;
+        inline const bool copySymlinkOwnership(const char * const toPath,const ::stat_reading::statWrap::statW & fromInfo) {
+            if(isDryRun)return true;
+            return lchown(toPath,fromInfo.st_uid,fromInfo.st_gid)==0;
+        }
     }
-    inline const bool copyFileMetadata(const int fromFd,const int toFd,const ::stat_reading::statWrap::statW & fromInfo) {
-        if(isDryRun)return true;
-        return (fchmod(toFd,fromInfo.st_mode)==0) && copyFileTimeData(toFd,fromInfo);
-    }
-    inline const bool copyDirTimeData(const char * const toDirPath,const ::stat_reading::statWrap::statW & fromInfo) {
-        if(isDryRun)return true;
-        timeval atim;
-        timeval mtim;
-        TIMESPEC_TO_TIMEVAL(&atim,&fromInfo.st_atim);
-        TIMESPEC_TO_TIMEVAL(&mtim,&fromInfo.st_mtim);
-        const struct timeval time[2]= {atim,mtim};
-        return utimes(toDirPath,time)==0;
-    }
-    inline const bool copyDirMetadata(const char * const toDirPath,const ::stat_reading::statWrap::statW & fromInfo) {
-        if(isDryRun)return true;
-        return chmod(toDirPath,fromInfo.st_mode)==0 &&copyDirTimeData(toDirPath,fromInfo);
-    }
-
 
 }
 
@@ -186,7 +214,17 @@ class Dir {
     DIR *m_dp;
     reading::direntWrapper::direntWrap  * m_next;
 };
-
+void readlinkNullTerminated(const char * const file,char * const targetBuf,const unsigned int targetBufSize) {
+    const ssize_t linkLen=readlink(file,targetBuf,targetBufSize);
+    if(linkLen<targetBufSize)targetBuf[linkLen]='\0';
+}
+const bool strcmpLimited(const char * const s1,const char * const s2,const unsigned int limit) {
+    for(unsigned int i=0; i<limit; i++) {
+        if(s1[i]!=s2[i])return false;
+        if(s1[i]=='\0')return true;
+    }
+    return true;
+}
 class File {
   private:
     File(const unsigned int len,char *const arrayPtr,const unsigned int addedLen):
@@ -206,9 +244,6 @@ class File {
     File(const File & other):File(other.getLen(),other.m_arr,0) {}
 
     ~File() {
-//        for(unsigned int i=getLen()-m_addedLen; i<getLen(); i++) {
-//            m_arr[i]='\0';
-//        }
         m_arr[getLen()-m_addedLen]='\0';
     }
     inline void reset(const char *const fileName,const unsigned int fileLen) {
@@ -256,34 +291,73 @@ class File {
         return ::mkdir(get(),mode)==0;
     }
 
+
     const bool copyDirTo(const File & destination)const {
         if(destination.exists()) {
-            if(isNewerThan(destination)) {
-                log("Update dir:",destination,false);
-                copying::copyDirMetadata(destination.get(),m_info);
-                return true;
+            if(!destination.isDir()) {
+                err("Already exists but not a directory!",destination);
+                return false;
             }
-            log("Skipping dir:",destination,false);
+            bool updated=false;
+            if(!compareEqualPermissions(destination)) {
+                updated=true;
+                copyDirPermissionsTo(destination);
+            }
+            if(!compareEqualOwnership(destination)) {
+                updated=true;
+                copyDirOwnershipTo(destination);
+            }
+            if(isNewerThan(destination)) {
+                updated=true;
+                copyDirTimeDataTo(destination);
+            }
+            if(updated) {
+                log("Update dir:",destination,false);
+            } else {
+                log("Skipping dir:",destination,false);
+            }
             return true;
         } else {
             const bool out=destination.mkdir(m_info.st_mode);
             if(out) {
-                return copying::copyDirMetadata(destination.get(),m_info);
+                copyDirPermissionsTo(destination);
+                copyDirOwnershipTo(destination);
+                copyDirTimeDataTo(destination);
+                return true;
             }
+            err("Copying failed!",*this);
             return false;
         }
     }
     const bool copyFileTo(const File & destination) const {
         int toFlags=O_WRONLY;
         if(destination.exists()) {
-            if(destination.isFile()) {
-                if(!isNewerThan(destination)) {
-                    log("Skipping:",destination,false);
-                    return true;
-                }
-            } else {
+            if(!destination.isFile()) {
                 err("Already exists but not a file!",destination);
                 return false;
+            }
+            if(isNewerThan(destination)) {
+                log("Updating:",destination,true);
+            } else {
+                bool updated=false;
+                if(!compareEqualPermissions(destination)) {
+                    updated=true;
+                    //Dir functions work also for files.
+                    //The distinction is only because we usually
+                    //access files with file descriptors and
+                    //directories with paths only
+                    copyDirPermissionsTo(destination);
+                }
+                if(!compareEqualOwnership(destination)) {
+                    updated=true;
+                    copyDirOwnershipTo(destination);
+                }
+                if(updated){
+                    log("Updating:",destination,false);
+                }else{
+                    log("Skipping:",destination,false);
+                }
+                return true;
             }
         } else {
             log("Creating:",destination,true);
@@ -297,20 +371,59 @@ class File {
 //        }
 
         const ssize_t copied= copying::sendfileWrapper(toFd,fromFd,0,getSize());
-        copying::copyFileMetadata(fromFd,toFd,m_info);
+        copyFilePermissionsTo(destination,toFd);
+        copyFileOwnershipTo(destination,toFd);
+        copyFileTimeDataTo(destination,toFd);
         close(toFd);
         close(fromFd);
-        return copied==getSize();
+        if(copied==getSize())return true;
+        err("Copying failed!",*this);
+        return false;
     }
-    inline const bool rm() {
+    inline const bool rm() const {
         log("Deleting: ",*this,true);
         if(isDryRun)return true;
-        return unlink(get())==0;
+        if(unlink(get())==0)return true;
+        err("Deleting failed!",*this);
+        return false;
     }
-    inline const bool rmdir() {
+    inline const bool rmdir() const {
         log("Deleting dir: ",*this,true);
         if(isDryRun)return true;
-        return ::rmdir(get())==0;
+        if(::rmdir(get())==0)return true;
+        err("Deleting failed!",*this);
+        return false;
+    }
+    inline const bool symlinkTo(const char * const target)const {
+        log("Symlinking: ",*this,true);
+        if(isDryRun)return true;
+        if(symlink(target,get())==0)return true;
+        err("Symlinking failed!",*this);
+        return false;
+    }
+    const bool copySymlinkTo(const File & newTo) const {
+        char target[PATH_MAX];
+        readlinkNullTerminated(get(),target,PATH_MAX);
+        if(newTo.exists()) {
+            if(newTo.isLink()) {
+                char existingTarget[PATH_MAX];
+                readlinkNullTerminated(newTo.get(),existingTarget,PATH_MAX);
+                if(strcmpLimited(target,existingTarget,PATH_MAX)) {
+                    //symlink already exists and points to the same target
+                    copySymlinkOwnershipTo(newTo);
+                    copySymlinkTimeDataTo(newTo);
+                    return true;
+                } else {
+                    //symlink already exists and points to different place
+                    newTo.rm();
+                    return copySymlinkTo(newTo,target);
+                }
+            } else {
+                err("Already exists but not a symlink!",newTo);
+                return false;
+            }
+        }
+        return copySymlinkTo(newTo,target);
     }
     inline void collectInfo() {
         if(stat_reading::statWrapper( get(), &m_info ) ==0) {
@@ -320,7 +433,66 @@ class File {
         }
     }
 
+    const bool compareEqualOwnership(const File & other) const {
+        return other.m_info.st_gid==m_info.st_gid&&other.m_info.st_uid==m_info.st_uid;
+    }
+    const bool compareEqualPermissions(const File & other) const{
+        const unsigned int PERMISSIONS_MASK=07777;
+        return (other.m_info.st_mode&PERMISSIONS_MASK)==(m_info.st_mode&PERMISSIONS_MASK);
+    }
   private:
+    inline const bool copyDirTimeDataTo(const File & destination)const {
+        if(copying::dir::copyDirTimeData(destination.get(),m_info))return true;
+        err("Copying timestamp failed!",destination);
+        return false;
+    }
+    inline const bool copyDirOwnershipTo(const File & destination)const {
+        if(copying::dir::copyDirOwnership(destination.get(),m_info))return true;
+        err("Copying ownership failed!",destination);
+        return false;
+    }
+    inline const bool copyDirPermissionsTo(const File & destination)const {
+        if(copying::dir::copyDirPermissions(destination.get(),m_info))return true;
+        err("Copying permissions failed!",destination);
+        return false;
+    }
+    inline const bool copyFileTimeDataTo(const File & destination,const int toFd)const {
+        if(copying::file::copyFileTimeData(toFd,m_info)) return true;
+        err("Copying timestamp failed!",destination);
+        return false;
+    }
+    inline const bool copyFileOwnershipTo(const File & destination,const int toFd)const {
+        if(compareEqualOwnership(destination)) return true;
+        if(copying::file::copyFileOwnership(toFd,m_info))return true;
+        err("Copying ownership failed!",destination);
+        return false;
+    }
+    inline const bool copyFilePermissionsTo(const File & destination,const int toFd)const {
+        if(compareEqualPermissions(destination)) return true;
+        if(copying::file::copyFilePermissions(toFd,m_info))return true;
+        err("Copying permissions failed!",destination);
+        return false;
+    }
+    inline const bool copySymlinkTimeDataTo(const File & destination)const {
+        if(destination.m_info.st_mtim.tv_sec==m_info.st_mtim.tv_sec)return true;
+        if(copying::symlnk::copySymlinkTimeData(destination.get(),m_info))return true;
+        err("Copying timestamp failed!",destination);
+        return false;
+    }
+    inline const bool copySymlinkOwnershipTo(const File & destination)const {
+        if(compareEqualOwnership(destination)) return true;
+        if(copying::symlnk::copySymlinkOwnership(destination.get(),m_info))return true;
+        err("Copying ownership failed!",destination);
+        return false;
+    }
+    const bool copySymlinkTo(const File & newTo,const char *const target) const {
+        if(newTo.symlinkTo(target)) {
+            copySymlinkOwnershipTo(newTo);
+            copySymlinkTimeDataTo(newTo);
+            return true;
+        }
+        return false;
+    }
     constexpr const unsigned int computeAddedLen(const unsigned int fileLen)const {
         return fileLen+1;
     }
@@ -332,10 +504,6 @@ class File {
         return m_infoCollected == INFO_COLLECTED_SUCCESSFULLY;
     }
     void fillPath(const unsigned int parentLen,const char *const fileName,const unsigned int fileLen) {
-//        unsigned int i=0;
-//        for(; i<parent.getLen(); i++) {
-//            m_arr[i]=parent[i];
-//        }
         unsigned int i=parentLen;
         m_arr[i++]='/';
         for(unsigned int j=0; j<fileLen; j++,i++) {
@@ -364,7 +532,7 @@ void log(const char * const msg,const File & f,const bool isModificationLog) {
     }
 }
 void err(const char * const msg,const File & f) {
-    logImpl(stderr,msg,f.get(),f.getLen());
+    fprintf(stderr,"ERROR: %s %s\n",msg,f.get());
 }
 
 /***Delete everything from TO  if it's not present in FROM.*/
@@ -403,7 +571,6 @@ void recursivePhase2(const File & from,const File & to) {
             const unsigned int len=strlen(name);
             newFrom.reset(name,len);
             newTo.reset(name,len);
-//            printf("%s %s\n",newFrom.get(),newTo.get());
             if((newTo.exists() && !newFrom.exists())) {
                 if(newTo.isDir()) {
                     if(isDryRun) {
@@ -436,6 +603,7 @@ void recCpy1(const File & newFrom,const File & newTo) {
         newFrom.copyFileTo(newTo);
     }
 }
+
 /***Copy everything FROM one directory TO another and update if modification date indicates so*/
 void recursivePhase1(const File & from,const File & to) {
 
@@ -451,12 +619,8 @@ void recursivePhase1(const File & from,const File & to) {
             const unsigned int len=strlen(name);
             newFrom.reset(name,len);
             newTo.reset(name,len);
-
             if(newFrom.isLink()) {
-                char copy[PATH_MAX];
-                strcpy(copy,boost::filesystem::canonical(newFrom.get()).c_str());
-                File resolvedFrom(copy);
-                recCpy1(resolvedFrom,newTo);
+                newFrom.copySymlinkTo(newTo);
             } else {
                 recCpy1(newFrom,newTo);
             }
@@ -510,6 +674,9 @@ void setOptionalParameters(const char * const arg) {
             isVerbose=false;
         }
         return;
+    } else if(arg[0]=='F') {
+        forceSymlinks=true;
+        return;
     } else if(arg[0]=='\0') {
         return;
     }
@@ -522,16 +689,17 @@ int main(int argc,  char*argv[])
 {
 //    argc=3;
 //    const char * argv[]= {"1","/my/garbage/from/","/my/garbage/to/"};
-//    File f("/my/garbage/to/lnk");
-//    boost::filesystem::path tmpPath=boost::filesystem::canonical(f.get());
-//    printf("%d %d %d %d %s %s\n",f.isDir(),f.isFile(),f.exists(),f.isLink(),f.get(), tmpPath.c_str());
+//    File tmpF("/mnt/backup/my/src/Python/Qt_GUIpy/YoutubeDownloader.py");
+//    boost::filesystem::path tmpPath=boost::filesystem::canonical(tmpF.get());
+//    printf("%d %d %d %d %s %s\n",tmpF.isDir(),tmpF.isFile(),tmpF.exists(),tmpF.isLink(),tmpF.get(), tmpPath.c_str());
 //    return 0;
+
     boost::filesystem::path src;
     boost::filesystem::path dest;
 
     if(!isValid(argc,argv,src,dest)) {
         printf("This is a simple tool for files synchronization. Usage:\n"
-               "mysync <phase> <source> <destination> (AA)\n"
+               "mysync <phase> <source> <destination> (AA) (F)\n"
                "Where:\n"
                "<phase> is either 1, 2 or 3. During phase 1 all files and folders are "
                "recursively copied from source directory to destination directory.\n"
@@ -546,21 +714,17 @@ int main(int argc,  char*argv[])
                "but once a directory is marked as 'changed' recursion will skip it. Only after adding 'A' all directory "
                "contents will be printed. Directories and files that are not modified are never listed, no matter if dry-run or not.\n"
                "If you add second 'A' (so it's double 'AA') then all output (except errors) will be surpressed. "
-               "This way you might achieve some extra performance gain.\n"
-               "Important: notice that symbolic links are followed during copying and each time a deep copy is performed. "
-               "The symlink itself is not copied but a new directory/file is created and named the same way as symlink. In case of directory, "
-               "all contents of symlink are copied too. During deleting (phase 2) symlinks are not followed. If necessary then symlinks "
-               "themselves are deleted, but their contents and referenced files stay intact.\n"
-               "Hard links, due to their nature, are not differentianted from regular files/directories. If a hard link is encountered by program, "
-               "then it will be treated just like any other file/directory.\n"
                "\n"
-               "It is recommended to NOT use mysync together with sudo or any other overpriviliged accounts!\n"
+               "Be careful when using mysync together with sudo!\n"
               );
         return 0;
     }
 
     if(argc>=5) {
         setOptionalParameters(argv[4]);
+        if(argc>=6) {
+            setOptionalParameters(argv[5]);
+        }
     }
 
     const int phase=static_cast<char>(argv[1][0]-'0');
@@ -584,8 +748,7 @@ int main(int argc,  char*argv[])
         recursivePhase2(f,t);
     } else if(phase==3) {
         printf("DELETING AND COPYING\n");
-//        recursivePhase2(src.c_str(),dest.c_str());
-        fprintf(stderr,"Phase 3 not yet implemented!\n");
+        fprintf(stderr,"Phase 3 not implemented yet!\n");
     } else {
         fprintf(stderr,"Unkown phase number!\n");
     }

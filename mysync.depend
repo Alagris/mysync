@@ -1,5 +1,5 @@
 # depslib dependency file v1.0
-1506357141 source:/mnt/personal/my/src/C++/commandline/mysync/main.cpp
+1506426880 source:/mnt/personal/my/src/C++/commandline/mysync/main.cpp
 	<sys/stat.h>
 	<sys/types.h>
 	<fcntl.h>
@@ -14,4 +14,5 @@
 	<time.h>
 	<utime.h>
 	<stdio.h>
+	<errno.h>
 
