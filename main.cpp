@@ -110,24 +110,71 @@ namespace opening {
     }
 }
 namespace copying {
-    template<int> const ssize_t  sendfileWrapperTemplate(int out_fd, int in_fd, off_t *offset, size_t count);
+    //template metaprogramming that solves real life problem! Whoohoo!
+    template<int> struct offWrapperTemplate;
+    template<> struct offWrapperTemplate<4>
+    {
+        typedef off_t off;
+    };
+    template<> struct offWrapperTemplate<8>
+    {
+        typedef off64_t off;
+    };
+    typedef offWrapperTemplate<sizeof(size_t)> offWrapper;
 
-    template<> const ssize_t sendfileWrapperTemplate<4>(int out_fd, int in_fd, off_t *offset, size_t count)
+
+    template<int> const ssize_t  sendfileWrapperTemplate(const int out_fd,const int in_fd, offWrapper::off *const offset,const size_t count);
+    template<> const ssize_t sendfileWrapperTemplate<4>(const int out_fd,const int in_fd, offWrapper::off *const offset,const size_t count)
     {
         if(isDryRun)return count;
         return sendfile(out_fd,  in_fd, offset, count);
     }
-
-    template<> const ssize_t  sendfileWrapperTemplate<8>(int out_fd, int in_fd, off_t *offset, size_t count)
+    template<> const ssize_t  sendfileWrapperTemplate<8>(const int out_fd,const int in_fd, offWrapper::off *const offset,const size_t count)
     {
         if(isDryRun)return count;
         return sendfile64(out_fd,  in_fd, offset, count);
     }
-    inline const ssize_t  sendfileWrapper(int out_fd, int in_fd, off_t *offset, size_t count) {
-        if(isDryRun)return true;
+    inline const ssize_t  sendfileWrapper(const int out_fd,const int in_fd, offWrapper::off *const offset,const size_t count) {
         return sendfileWrapperTemplate<sizeof(size_t)>( out_fd,  in_fd, offset, count);
     }
+
+
+    template<int> const int ftruncateWrapperTemplate(const int fd, const offWrapper::off length);
+    template<> const int ftruncateWrapperTemplate<4>(const int fd, const offWrapper::off length)
+    {
+        if(isDryRun)return 1;
+        return ftruncate(fd, length);
+    }
+    template<> const int ftruncateWrapperTemplate<8>(const int fd,const offWrapper::off length)
+    {
+        if(isDryRun)return 1;
+        return ftruncate64(fd, length);
+    }
+    inline const int ftruncateWrapper(const int fd,const offWrapper::off length) {
+        return ftruncateWrapperTemplate<sizeof(size_t)>( fd, length);
+    }
+
+
     namespace file {
+//        ssize_t do_sendfile(int out_fd, int in_fd, size_t count) {
+//            offWrapper::off offset;
+//            ssize_t bytes_sent;
+//            size_t total_bytes_sent = 0;
+//            while (total_bytes_sent < count) {
+//                if ((bytes_sent = sendfileWrapper(out_fd, in_fd, &offset,count - total_bytes_sent)) <= 0) {
+//                    if (errno == EINTR || errno == EAGAIN) {
+//                        // Interrupted system call/try again
+//                        // Just skip to the top of the loop and try again
+//                        continue;
+//                    }
+//                    perror("sendfile");
+//                    return -1;
+//                }
+//                total_bytes_sent += bytes_sent;
+//            }
+//            return total_bytes_sent;
+//        }
+
         inline const bool copyFileTimeData(const int toFd,const ::stat_reading::statWrap::statW & fromInfo) {
             if(isDryRun)return true;
             const struct timespec time[2]= {fromInfo.st_atim,fromInfo.st_mtim};
@@ -225,6 +272,7 @@ const bool strcmpLimited(const char * const s1,const char * const s2,const unsig
     }
     return true;
 }
+
 class File {
   private:
     File(const unsigned int len,char *const arrayPtr,const unsigned int addedLen):
@@ -279,7 +327,7 @@ class File {
     inline const bool exists() const {
         return hasInfoAvailable();
     }
-    inline const off_t getSize()const {
+    inline const copying::offWrapper::off getSize()const {
         return m_info.st_size;
     }
     inline const bool isNewerThan(const File & other) const {
@@ -352,9 +400,9 @@ class File {
                     updated=true;
                     copyDirOwnershipTo(destination);
                 }
-                if(updated){
+                if(updated) {
                     log("Updating:",destination,false);
-                }else{
+                } else {
                     log("Skipping:",destination,false);
                 }
                 return true;
@@ -369,8 +417,8 @@ class File {
 //        if(destination.isFile()){
 //            fallocate(toFd,0,0,getSize());
 //        }
-
         const ssize_t copied= copying::sendfileWrapper(toFd,fromFd,0,getSize());
+        if(destination.getSize()>getSize())copying::ftruncateWrapper(toFd, getSize());
         copyFilePermissionsTo(destination,toFd);
         copyFileOwnershipTo(destination,toFd);
         copyFileTimeDataTo(destination,toFd);
@@ -436,7 +484,7 @@ class File {
     const bool compareEqualOwnership(const File & other) const {
         return other.m_info.st_gid==m_info.st_gid&&other.m_info.st_uid==m_info.st_uid;
     }
-    const bool compareEqualPermissions(const File & other) const{
+    const bool compareEqualPermissions(const File & other) const {
         const unsigned int PERMISSIONS_MASK=07777;
         return (other.m_info.st_mode&PERMISSIONS_MASK)==(m_info.st_mode&PERMISSIONS_MASK);
     }
